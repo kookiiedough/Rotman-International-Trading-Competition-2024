@@ -1,22 +1,48 @@
 import requests
 from time import sleep
 import signal
+import json # For loading configuration
+import logging # For logging
+from alpha_vantage_client import get_daily_adjusted_stock_data, calculate_simple_insights
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Initialize shutdown flag
 shutdown = False
+# Global config variable
+CONFIG = None
+
+def load_config(config_path="config.json"):
+    """Loads the configuration from a JSON file."""
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        logger.info(f"Configuration loaded from {config_path}")
+        return config
+    except FileNotFoundError:
+        logger.error(f"Configuration file '{config_path}' not found. Please copy 'config.template.json' to '{config_path}' and fill in your API keys and stock symbols.")
+        return None
+    except json.JSONDecodeError:
+        logger.error(f"Could not parse '{config_path}'. Ensure it is valid JSON.")
+        return None
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred while loading config from {config_path}: {e}")
+        return None
 
 def signal_handler(signum, frame):
     global shutdown
-    print("Shutdown signal received")
+    logger.info("Shutdown signal received")
     shutdown = True
 
 # Set the signal handler for graceful shutdown
 signal.signal(signal.SIGINT, signal_handler)
 
-# API Configuration
-api_endpoint = "http://localhost:16620"
-API_KEY = "----"  # Replace with your actual API key
-headers = {"X-API-Key": API_KEY}
+# API Configuration - will be updated by load_config
+api_endpoint = "http://localhost:16620" 
+# API_KEY will be loaded from config
+# headers will be set after config is loaded
 
 # Profit/Loss Tracking
 # profit_loss = 0
@@ -229,26 +255,84 @@ def tender_process(s):
                 exit_position(s, i['ticker'],i['position'])
 def main_loop():
     """Main trading loop."""
+    global CONFIG, headers # Allow modification of global headers
+
+    if not CONFIG:
+        logger.error("Configuration not loaded. Exiting main_loop.")
+        return
+
+    # Use trading_api_key from config for RITC platform
+    ritc_api_key = CONFIG.get("trading_api_key", "----") 
+    if ritc_api_key == "YOUR_TRADING_API_KEY_HERE" or ritc_api_key == "----":
+        logger.warning("RITC Trading API key is not set in config.json or is still the default placeholder.")
+    headers = {"X-API-Key": ritc_api_key} # Define headers here for global use if needed, or pass to functions
+
+    alpha_vantage_api_key = CONFIG.get("alpha_vantage_api_key")
+    if not alpha_vantage_api_key or alpha_vantage_api_key == "YOUR_API_KEY_HERE":
+        logger.warning("Alpha Vantage API key is not set in config.json. External data fetching will fail.")
+    
+    stocks_to_analyze = CONFIG.get("stocks_to_analyze", [])
+    if not stocks_to_analyze:
+        logger.info("No stocks specified for Alpha Vantage analysis in config.json.")
+
     session = requests.Session()
+    alpha_vantage_fetch_counter = 0
+    iterations_per_av_fetch = CONFIG.get("alpha_vantage_fetch_interval_seconds", 60) # Default to 60s
 
     while not shutdown:
         try:
-            tenders = get_tenders(session)
+            # Existing tender processing logic
+            tenders = get_tenders(session) 
             for tender in tenders:
-                execute_tender_if_profitable(session, tender)
-                adjust_positions_based_on_performance(session)
+                execute_tender_if_profitable(session, tender) # Assumes this function uses global `headers` or has it passed
             
+            adjust_positions_based_on_performance(session) # Same assumption for headers
+
+            # Alpha Vantage data fetching and insights
+            if alpha_vantage_api_key and alpha_vantage_api_key != "YOUR_API_KEY_HERE" and stocks_to_analyze:
+                if alpha_vantage_fetch_counter % iterations_per_av_fetch == 0:
+                    for stock_info in stocks_to_analyze:
+                        symbol = stock_info.get("symbol")
+                        n_days = stock_info.get("n_days")
+
+                        if not symbol or not n_days:
+                            logger.warning(f"Skipping invalid stock entry in config: {stock_info}")
+                            continue
+                        
+                        logger.info(f"Attempting to fetch Alpha Vantage data for {symbol}...")
+                        try:
+                            time_series_data = get_daily_adjusted_stock_data(alpha_vantage_api_key, symbol)
+                            if time_series_data:
+                                logger.info(f"Successfully fetched Alpha Vantage data for {symbol}.")
+                                logger.info(f"Calculating {n_days}-day insights for {symbol}...")
+                                insights = calculate_simple_insights(time_series_data, n_days)
+                                if insights:
+                                    logger.info(f"Insights for {symbol}: {n_days}-Day SMA: {insights.get('n_day_sma')}, {n_days}-Day % Change: {insights.get('n_day_percentage_change')}%")
+                                else:
+                                    logger.warning(f"Could not calculate insights for {symbol} from fetched data.")
+                            else:
+                                logger.warning(f"Failed to fetch Alpha Vantage data for {symbol}.")
+                        except Exception as e: # Catch-all for this specific stock's AV processing
+                            logger.exception(f"Unexpected error processing Alpha Vantage stock {symbol}: {e}")
             
-            sleep(1)  # Adjust based on your requirements
+            alpha_vantage_fetch_counter += 1
+            sleep(1)
         except ApiException as e:
-            print(f"API error: {e}")
+            logger.error(f"RITC API error in main_loop: {e}")
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            logger.exception(f"Unexpected error in main_loop: {e}")
         finally:
-            # Add any cleanup here if needed
             pass
 
-    print("Exiting main loop.")
+    logger.info("Exiting main loop.")
 
 if __name__ == "__main__":
-    main_loop()
+    logger.info("Application starting...")
+    CONFIG = load_config()
+    if CONFIG:
+        API_KEY = CONFIG.get("trading_api_key", "----") 
+        # headers will be set in main_loop after CONFIG is confirmed
+        main_loop()
+    else:
+        logger.error("Could not start the application due to configuration errors.")
+        # Consider sys.exit(1) here if appropriate for your deployment strategy
